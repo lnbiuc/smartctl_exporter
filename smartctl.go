@@ -14,10 +14,13 @@
 package main
 
 import (
+	"context"
 	"fmt"
 	"log/slog"
+	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/tidwall/gjson"
@@ -274,6 +277,22 @@ func (smart *SMARTctl) mineRotationRate() {
 }
 
 func (smart *SMARTctl) mineTemperatures() {
+	// 检查硬盘是否处于休眠状态
+	if smart.checkDriveStandbyMode() {
+		// 硬盘处于休眠状态，返回固定温度值10度
+		smart.ch <- prometheus.MustNewConstMetric(
+			metricDeviceTemperature,
+			prometheus.GaugeValue,
+			10.0, // 固定返回10度
+			smart.device.device,
+			"current", // 温度类型
+		)
+
+		smart.logger.Debug("Device is in standby mode, returning fixed temperature 10°C", "device", smart.device.device)
+		return
+	}
+
+	// 原有的温度获取逻辑
 	temperatures := smart.json.Get("temperature")
 	// TODO: Implement scsi_environmental_reports
 	if temperatures.Exists() {
@@ -639,4 +658,69 @@ func (smart *SMARTctl) mineSCSIErrorCounterLog() {
 		)
 		// TODO: Should we also export the verify category?
 	}
+}
+
+// checkDriveStandbyMode 检查硬盘是否处于休眠状态
+// 返回 true 表示硬盘处于休眠状态，false 表示硬盘处于活跃状态或检测失败
+func (smart *SMARTctl) checkDriveStandbyMode() bool {
+	// 从 JSON 数据中获取原始设备路径和类型
+	deviceName := smart.json.Get("device.name").String()
+	deviceType := smart.json.Get("device.type").String()
+
+	if deviceName == "" {
+		smart.logger.Debug("Device name not found, skipping standby check")
+		return false
+	}
+
+	// 构建 smartctl 命令，使用 -n standby 参数检测电源状态
+	cmdArgs := []string{
+		"-n", "standby",
+		"-i", // 只获取基本信息，不获取详细数据
+	}
+
+	// 添加设备类型参数（如果有的话）
+	if deviceType != "" {
+		cmdArgs = append(cmdArgs, "-d", deviceType)
+	}
+
+	// 添加设备路径
+	cmdArgs = append(cmdArgs, deviceName)
+
+	// 设置超时时间，避免长时间等待
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+
+	// 执行命令 - 这里我们需要找到 smartctl 的路径
+	// 通常在 /usr/sbin/smartctl 或 /usr/bin/smartctl
+	smartctlPath := "/usr/sbin/smartctl"
+	if _, err := exec.LookPath("smartctl"); err == nil {
+		smartctlPath = "smartctl"
+	}
+
+	cmd := exec.CommandContext(ctx, smartctlPath, cmdArgs...)
+	out, err := cmd.CombinedOutput()
+
+	if err != nil {
+		// 检查退出码
+		if exitError, ok := err.(*exec.ExitError); ok {
+			exitCode := exitError.ExitCode()
+			// 退出码2表示设备处于低电源模式（SLEEP或STANDBY）
+			if exitCode == 2 {
+				smart.logger.Debug("Device is in standby/sleep mode", "device", deviceName)
+				return true
+			}
+		}
+		// 其他错误情况，记录日志但不影响后续流程
+		smart.logger.Debug("Failed to check standby mode for device", "device", deviceName, "error", err)
+		return false
+	}
+
+	// 如果命令成功执行，解析输出判断电源状态
+	outputStr := string(out)
+	if strings.Contains(outputStr, "SLEEP") || strings.Contains(outputStr, "STANDBY") {
+		smart.logger.Debug("Device is in standby/sleep mode (from output)", "device", deviceName)
+		return true
+	}
+
+	return false
 }
